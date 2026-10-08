@@ -1,6 +1,6 @@
 [package]
 name = "pausic"
-version = "1.0.0"
+version = "1.1.0"
 description = "Lightweight Windows tray app that pauses media while your microphone is in use."
 license = "MIT"
 repository = "https://github.com/tbrain443/Pausic"
@@ -13,6 +13,7 @@ name = "Pausic"
 path = "src/main.rs"
 
 [dependencies]
+windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
     "Foundation",
     "Media_Control",

@@ -55,5 +55,5 @@ jobs:
         run: |
           sha256sum Pausic.exe > SHA256SUMS.txt
           gh release create "$RELEASE_TAG" Pausic.exe SHA256SUMS.txt \
-            --verify-tag --title "Pausic $RELEASE_TAG" \
-            --notes "Portable Windows x64 tray app written in Rust. Pauses media while your microphone is in use, then resumes only the sessions it paused. Uses Windows Core Audio and GSMTC. Download Pausic.exe below; no installer or separate runtime needed. See the README for usage, measurements, and compatibility."
+            --verify-tag --title "Pausic $RELEASE_TAG" --generate-notes \
+            --notes "Portable Windows x64 tray app written in Rust. Pauses media while your microphone is in use, then resumes only the sessions it paused. Uses event-driven Windows Core Audio notifications and GSMTC. No periodic microphone polling. Download Pausic.exe below; no installer or separate runtime needed. See the README for usage, measurements, and compatibility."

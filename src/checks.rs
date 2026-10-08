@@ -43,8 +43,19 @@ fn capture_monitor_handles_overlapping_streams() -> Result<()> {
     assert!(receive.recv_timeout(Duration::from_millis(400)).is_err());
     monitor.restart();
     assert!(receive.recv_timeout(Duration::from_millis(300)).is_err());
+    let reopened = Microphone::open()?;
     drop(second);
+    assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+    reopened.activate()?;
+    assert!(receive.recv_timeout(Duration::from_millis(400)).is_err());
+    drop(reopened);
     assert!(receive.recv_timeout(Duration::from_millis(150)).is_err());
+    assert!(!receive.recv_timeout(Duration::from_secs(2)).unwrap());
+    monitor.restart();
+    assert!(receive.recv_timeout(Duration::from_millis(300)).is_err());
+    let fresh = Microphone::start()?;
+    assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+    drop(fresh);
     assert!(!receive.recv_timeout(Duration::from_secs(2)).unwrap());
     drop(monitor);
     Ok(())
@@ -95,12 +106,20 @@ struct Player {
 struct Microphone(windows::Win32::Media::Audio::IAudioClient);
 impl Microphone {
     fn start() -> Result<Self> {
+        let microphone = Self::open()?;
+        microphone.activate()?;
+        Ok(microphone)
+    }
+    fn activate(&self) -> Result<()> {
+        unsafe { self.0.Start() }
+    }
+    fn open() -> Result<Self> {
         use windows::Win32::{
             Media::Audio::{
                 AUDCLNT_SHAREMODE_SHARED, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
                 eCapture, eConsole,
             },
-            System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree},
+            System::Com::{CLSCTX_ALL, CoCreateGuid, CoCreateInstance, CoTaskMemFree},
         };
         unsafe {
             let devices: IMMDeviceEnumerator =
@@ -108,10 +127,17 @@ impl Microphone {
             let device = devices.GetDefaultAudioEndpoint(eCapture, eConsole)?;
             let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let format = client.GetMixFormat()?;
-            let result = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000, 0, format, None);
+            let session = CoCreateGuid()?;
+            let result = client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                0,
+                1000000,
+                0,
+                format,
+                Some(&session),
+            );
             CoTaskMemFree(Some(format.cast()));
             result?;
-            client.Start()?;
             Ok(Self(client))
         }
     }
@@ -228,5 +254,43 @@ fn gsmtc_restores_only_original_sessions() -> Result<()> {
         Status::Paused,
         "ownership cleared after resume"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "opens real microphone streams to check the active startup baseline"]
+fn capture_monitor_preserves_active_startup() -> Result<()> {
+    let _apartment = Apartment::new()?;
+    assert!(
+        !mic_monitor::read_in_use()?,
+        "close other microphone users first"
+    );
+    let microphone = Microphone::start()?;
+    let (send, receive) = mpsc::channel();
+    let monitor = mic_monitor::Monitor::start(move |active| {
+        let _ = send.send(active);
+    })?;
+    assert!(receive.recv_timeout(Duration::from_millis(400)).is_err());
+    drop(microphone);
+    assert!(!receive.recv_timeout(Duration::from_secs(2)).unwrap());
+    let next = Microphone::start()?;
+    assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+    drop(next);
+    assert!(!receive.recv_timeout(Duration::from_secs(2)).unwrap());
+    drop(monitor);
+    Ok(())
+}
+
+#[test]
+#[ignore = "holds a real capture stream for 30 seconds to measure Pausic CPU usage"]
+fn hold_real_capture_for_measurement() -> Result<()> {
+    let _apartment = Apartment::new()?;
+    assert!(
+        !mic_monitor::read_in_use()?,
+        "close other microphone users first"
+    );
+    let _microphone = Microphone::start()?;
+    println!("CAPTURE_READY");
+    sleep(Duration::from_secs(30));
     Ok(())
 }

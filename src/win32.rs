@@ -4,7 +4,6 @@ use windows::{
         Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE},
         System::{
             Registry::*,
-            Threading::*,
             WinRT::{RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
         },
     },
@@ -46,19 +45,6 @@ pub struct Handle(pub HANDLE);
 // Kernel events/mutexes are thread-safe; ownership/Arc keeps the handle alive during every wait.
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
-
-impl Handle {
-    pub fn event(manual: bool) -> Result<Self> {
-        // No name/security pointer is retained; the returned handle is uniquely owned.
-        unsafe { CreateEventW(None, manual, false, None).map(Self) }
-    }
-
-    pub fn signal(&self) {
-        unsafe {
-            let _ = SetEvent(self.0);
-        }
-    }
-}
 
 impl Drop for Handle {
     fn drop(&mut self) {

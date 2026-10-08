@@ -1,88 +1,378 @@
-use crate::win32::{Apartment, Handle};
+use crate::win32::Apartment;
 use std::{
-    sync::Arc,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use windows::{
     Win32::{
-        Foundation::WAIT_TIMEOUT,
-        Media::Audio::{
-            AudioSessionStateActive, DEVICE_STATE_ACTIVE, IAudioSessionManager2,
-            IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
-        },
-        System::{
-            Com::{CLSCTX_ALL, CoCreateInstance},
-            Threading::WaitForMultipleObjects,
-        },
+        Foundation::PROPERTYKEY,
+        Media::Audio::*,
+        System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree},
     },
-    core::Result,
+    core::{BOOL, GUID, Interface, PCWSTR, Ref, Result, implement},
 };
 
 const RELEASE_DEBOUNCE: Duration = Duration::from_millis(250);
-const RESCAN_MS: u32 = 100;
+const RECOVERY_DELAY: Duration = Duration::from_secs(1);
 
 pub struct Monitor {
-    stop: Arc<Handle>,
-    restart: Arc<Handle>,
+    send: Sender<Event>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Monitor {
     pub fn start(changed: impl Fn(bool) + Send + 'static) -> Result<Self> {
-        let stop = Arc::new(Handle::event(true)?);
-        let restart = Arc::new(Handle::event(false)?);
-        let signals = (stop.clone(), restart.clone());
+        let (send, receive) = mpsc::channel();
+        let callbacks = send.clone();
         let thread = thread::Builder::new()
             .name("Pausic microphone".into())
-            .spawn(move || {
-                let (stop, restart) = signals;
-                let mut transition = Transition::default();
-                let mut apartment = None;
-                loop {
-                    if apartment.is_none() {
-                        apartment = Apartment::new().ok();
-                    }
-                    if apartment.is_some() {
-                        match read_in_use() {
-                            Ok(active) => {
-                                if let Some(active) = transition.observe(active, Instant::now()) {
-                                    changed(active);
-                                }
-                            }
-                            // An unknown state must never resume media. Require a new, complete
-                            // release debounce after recovery from a device/service error.
-                            Err(_) => transition.since = Instant::now(),
-                        }
-                    }
-                    match unsafe { WaitForMultipleObjects(&[stop.0, restart.0], false, RESCAN_MS) }
-                        .0
-                    {
-                        0 => break,
-                        1 => {} // Next scan recreates the device/session snapshot after resume.
-                        n if n == WAIT_TIMEOUT.0 => {}
-                        _ => break,
-                    }
-                }
-            })?;
+            .spawn(move || run(receive, callbacks, changed))?;
         Ok(Self {
-            stop,
-            restart,
+            send,
             thread: Some(thread),
         })
     }
 
     pub fn restart(&self) {
-        self.restart.signal();
+        let _ = self.send.send(Event::Restart);
     }
 }
 
 impl Drop for Monitor {
     fn drop(&mut self) {
-        self.stop.signal();
+        let _ = self.send.send(Event::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+enum Event {
+    Stop,
+    Restart,
+    Rebuild(u64),
+    State(u64),
+    Session(u64, usize, CaptureSession),
+}
+
+// Session notifications and our worker share the MTA; no apartment boundary is crossed.
+// Keep the provided session alive until the worker can register its state listener.
+struct CaptureSession(IAudioSessionControl);
+unsafe impl Send for CaptureSession {}
+
+fn run(receive: Receiver<Event>, send: Sender<Event>, changed: impl Fn(bool)) {
+    let mut apartment = None;
+    let mut snapshot = None;
+    let mut generation = 0;
+    let mut transition = Transition::default();
+    let mut retry = Some(Instant::now());
+    loop {
+        if retry.is_some_and(|deadline| Instant::now() >= deadline) {
+            // Drop/unregister on the worker, never inside a Core Audio callback.
+            snapshot = None;
+            generation += 1;
+            if apartment.is_none() {
+                apartment = Apartment::new().ok();
+            }
+            if apartment.is_some() {
+                snapshot = Snapshot::new(send.clone(), generation).ok();
+            }
+            retry = snapshot.is_none().then(|| Instant::now() + RECOVERY_DELAY);
+        }
+        if let Some(current) = &mut snapshot {
+            match current.in_use() {
+                Ok(active) => {
+                    if let Some(active) = transition.observe(active, Instant::now()) {
+                        changed(active);
+                    }
+                }
+                Err(_) => {
+                    // Unknown activity must not resume media, even across service recovery.
+                    transition.since = Instant::now();
+                    retry = Some(Instant::now() + RECOVERY_DELAY);
+                    snapshot = None;
+                }
+            }
+        } else {
+            transition.since = Instant::now();
+        }
+        let release = (retry.is_none() && transition.stable == Some(true) && !transition.candidate)
+            .then_some(transition.since + RELEASE_DEBOUNCE);
+        let deadline = retry.or(release);
+        let event = match deadline {
+            Some(deadline) => {
+                match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match receive.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            },
+        };
+        match event {
+            Event::Stop => break,
+            Event::Restart => retry = Some(Instant::now()),
+            Event::Rebuild(id) if id == generation => retry = Some(Instant::now()),
+            Event::Session(id, endpoint, session) if id == generation => {
+                if let Some(endpoint) = snapshot
+                    .as_mut()
+                    .and_then(|current| current.endpoints.get_mut(endpoint))
+                    .and_then(Option::as_mut)
+                {
+                    if endpoint.add(session.0, send.clone(), generation).is_err() {
+                        transition.since = Instant::now();
+                        retry = Some(Instant::now() + RECOVERY_DELAY);
+                        snapshot = None;
+                    }
+                }
+            }
+            Event::State(id) if id == generation => {}
+            _ => continue, // Discard callbacks from an unregistered snapshot.
+        }
+    }
+    // Keep the queue and MTA alive until every notification has been unregistered.
+    drop(snapshot);
+    drop(receive);
+    drop(apartment);
+}
+
+struct Snapshot {
+    devices: IMMDeviceEnumerator,
+    listener: IMMNotificationClient,
+    endpoints: Vec<Option<Endpoint>>,
+    failure: Option<windows_core::Error>,
+}
+
+impl Snapshot {
+    fn new(send: Sender<Event>, generation: u64) -> Result<Self> {
+        unsafe {
+            let devices: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let listener = Callbacks {
+                send: send.clone(),
+                generation,
+                endpoint: 0,
+            }
+            .into();
+            devices.RegisterEndpointNotificationCallback(&listener)?;
+            let mut snapshot = Self {
+                devices,
+                listener,
+                endpoints: Vec::new(),
+                failure: None,
+            };
+            let devices = snapshot
+                .devices
+                .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+            for index in 0..devices.GetCount()? {
+                let result = (|| -> Result<Endpoint> {
+                    let device = devices.Item(index)?;
+                    let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+                    let listener = Callbacks {
+                        send: send.clone(),
+                        generation,
+                        endpoint: snapshot.endpoints.len(),
+                    }
+                    .into();
+                    manager.RegisterSessionNotification(&listener)?;
+                    let mut endpoint = Endpoint {
+                        manager,
+                        listener,
+                        sessions: Vec::new(),
+                    };
+                    // Register before enumeration. GetCount also enables new-session notifications.
+                    let sessions = endpoint.manager.GetSessionEnumerator()?;
+                    for index in 0..sessions.GetCount()? {
+                        endpoint.add(sessions.GetSession(index)?, send.clone(), generation)?;
+                    }
+                    Ok(endpoint)
+                })();
+                match result {
+                    Ok(endpoint) => snapshot.endpoints.push(Some(endpoint)),
+                    Err(error) => {
+                        snapshot.failure = Some(error);
+                        snapshot.endpoints.push(None);
+                    }
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+
+    fn in_use(&mut self) -> Result<bool> {
+        let mut failure = self.failure.clone();
+        let mut active = false;
+        for endpoint in self.endpoints.iter_mut().flatten() {
+            endpoint
+                .sessions
+                .retain(|session| match unsafe { session.control.GetState() } {
+                    Ok(state) => {
+                        active |= state == AudioSessionStateActive;
+                        state != AudioSessionStateExpired
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        true
+                    }
+                });
+        }
+        if active {
+            Ok(true)
+        } else if let Some(error) = failure {
+            Err(error)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self
+                .devices
+                .UnregisterEndpointNotificationCallback(&self.listener);
+        }
+    }
+}
+
+struct Endpoint {
+    manager: IAudioSessionManager2,
+    listener: IAudioSessionNotification,
+    sessions: Vec<Session>,
+}
+
+impl Endpoint {
+    fn add(
+        &mut self,
+        control: IAudioSessionControl,
+        send: Sender<Event>,
+        generation: u64,
+    ) -> Result<()> {
+        unsafe {
+            let identifier = control
+                .cast::<IAudioSessionControl2>()?
+                .GetSessionInstanceIdentifier()?;
+            let id = identifier.to_string();
+            CoTaskMemFree(Some(identifier.0.cast()));
+            let id = id?;
+            if self.sessions.iter().any(|session| session.id == id) {
+                return Ok(());
+            }
+            let listener = Callbacks {
+                send,
+                generation,
+                endpoint: 0,
+            }
+            .into();
+            control.RegisterAudioSessionNotification(&listener)?;
+            self.sessions.push(Session {
+                id,
+                control,
+                listener,
+            });
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.manager.UnregisterSessionNotification(&self.listener);
+        }
+    }
+}
+
+struct Session {
+    id: String,
+    control: IAudioSessionControl,
+    listener: IAudioSessionEvents,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self
+                .control
+                .UnregisterAudioSessionNotification(&self.listener);
+        }
+    }
+}
+
+// Notifications only enqueue work. COM calls and ownership changes happen on our MTA worker.
+#[implement(IAudioSessionEvents, IAudioSessionNotification, IMMNotificationClient)]
+struct Callbacks {
+    send: Sender<Event>,
+    generation: u64,
+    endpoint: usize,
+}
+
+impl Callbacks_Impl {
+    fn rebuild(&self) -> Result<()> {
+        let _ = self.send.send(Event::Rebuild(self.generation));
+        Ok(())
+    }
+}
+
+#[allow(non_snake_case)]
+impl IAudioSessionNotification_Impl for Callbacks_Impl {
+    fn OnSessionCreated(&self, session: Ref<IAudioSessionControl>) -> Result<()> {
+        let _ = self.send.send(Event::Session(
+            self.generation,
+            self.endpoint,
+            CaptureSession(session.ok()?.clone()),
+        ));
+        Ok(())
+    }
+}
+
+#[allow(non_snake_case)]
+impl IAudioSessionEvents_Impl for Callbacks_Impl {
+    fn OnStateChanged(&self, _: AudioSessionState) -> Result<()> {
+        let _ = self.send.send(Event::State(self.generation));
+        Ok(())
+    }
+    fn OnSessionDisconnected(&self, _: AudioSessionDisconnectReason) -> Result<()> {
+        self.rebuild()
+    }
+    fn OnDisplayNameChanged(&self, _: &PCWSTR, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnIconPathChanged(&self, _: &PCWSTR, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnSimpleVolumeChanged(&self, _: f32, _: BOOL, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnChannelVolumeChanged(&self, _: u32, _: *const f32, _: u32, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnGroupingParamChanged(&self, _: *const GUID, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[allow(non_snake_case)]
+impl IMMNotificationClient_Impl for Callbacks_Impl {
+    fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> Result<()> {
+        self.rebuild()
+    }
+    fn OnDeviceAdded(&self, _: &PCWSTR) -> Result<()> {
+        self.rebuild()
+    }
+    fn OnDeviceRemoved(&self, _: &PCWSTR) -> Result<()> {
+        self.rebuild()
+    }
+    fn OnDefaultDeviceChanged(&self, _: EDataFlow, _: ERole, _: &PCWSTR) -> Result<()> {
+        Ok(())
+    }
+    fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -120,10 +410,10 @@ impl Transition {
     }
 }
 
+#[cfg(test)]
 pub fn read_in_use() -> Result<bool> {
     // Query capture endpoints, never render/loopback endpoints. No recording stream is opened.
-    // Recreate the snapshot each scan to discover new sessions and hot-plugged devices without
-    // retaining a potentially stale session enumerator or device after an audio-service restart.
+    // Independent snapshot for real-device test assertions. Production uses subscriptions.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
