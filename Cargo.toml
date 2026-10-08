@@ -1,0 +1,37 @@
+[package]
+name = "pausic"
+version = "1.0.0"
+description = "Lightweight Windows tray app that pauses media while your microphone is in use."
+license = "MIT"
+repository = "https://github.com/tbrain443/Pausic"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "Pausic"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+    "Foundation",
+    "Media_Control",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+windows = { version = "0.62.2", features = ["Media_Playback"] }
